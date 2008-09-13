@@ -1,0 +1,4 @@
+Revision history for Perl extension Devel::DTrace::Provider.
+
+0.01  Fri Sep 12 17:16:04 2008
+	Initial version, supporting Intel Solaris and OSX only.
