@@ -6,7 +6,7 @@ use warnings;
 
 
 BEGIN {
-	our $VERSION = '0.01';
+	our $VERSION = '0.02';
 	require XSLoader;
 	eval {
 		XSLoader::load('Devel::DTrace::Provider', $VERSION);
@@ -94,6 +94,8 @@ sub dof_size {
 		$size += $sec;
 		my $i = $size % 8;
 		if ($i > 0) {
+			# Size estimate simplification - assume
+			# everything is 8-byte aligned
 			$size += int((8 - $i));
 		}
 	}
@@ -125,7 +127,7 @@ sub enable {
 			$argv = $i if $argv == 0;
 		}
 		
-		my $probe = Devel::DTrace::Probe->new($argc);
+		my $probe = Devel::DTrace::Probe->new($pd->args);
 		push @$probes, 
 		{
 		 name     => $self->{_strtab}->add($pd->name),
@@ -161,6 +163,8 @@ sub enable {
 	$s->data([@data]);
 	push @{$f->sections}, $s;
 
+	# This must happen after we know the eventual size of the DOF,
+	# but before we add any probe addresses. 
 	$f->allocate($self->dof_size);
 
 	$s = Devel::DTrace::DOF::Section->new(DOF_SECT_PROFFS, 3);
@@ -290,7 +294,7 @@ happens:
 
 Native functions are created for each probe, containing the DTrace
 tracepoints to be enabled later by the kernel. DOF (DTrace Object
-Dormat) is then generated representing the provider and the
+Format) is then generated representing the provider and the
 tracepoints generated, and is inserted into the kernel via the DTrace
 helper device. Perl functions are created for each probe, so they can
 be fired from Perl code.
@@ -302,9 +306,15 @@ visible from both parent and child processes separately.  Redefining a
 provider should be possible within the same process. These two
 features permit providers to be created by mod_perl applications. 
 
+This module may be installed on systems which do not support DTrace:
+in this case, no native code is built, and providers created by the
+Builder module will be stubbed out such that there is zero runtime
+overhead. This can be useful for applications which should run on
+multiple platforms while still having the probe code embedded. 
+
 =head2 Using Perl providers
 
-=over4
+=over 4
 
 =item Listing probes available
 
@@ -392,6 +402,13 @@ an error inserting the provider into the kernel, or if memory could
 not be allocated for the tracepoint functions.
 
 Returns a hash of probe "stubs", Devel::DTrace::Probe objects. 
+
+=head1 DEVELOPMENT
+
+The source to Devel::DTrace::Provider is in github:
+
+  http://github.com/chrisa/perl-dtrace/tree/master/Devel-DTrace-Provider
+
 
 =head1 AUTHOR
 
