@@ -1,41 +1,63 @@
-use 5.008;
 use ExtUtils::MakeMaker;
+use Config;
 
-# TODO: catch early versions of these, handle failure by not building
-# the XS part.
-my $platform = $^O;
-my $build_native = 0;
-if ($platform eq 'darwin') {
-	print STDERR "Building for OS X\n";
-	symlink 'DTrace_Probe.xs-darwin', 'DTrace_Probe.xs';
-	if (-f '/usr/include/dtrace.h') {
-		print STDERR "DTrace available, building native components\n";
-		$build_native = 1;
-	}
+# Try to work out if DTrace is available.
+my $dtrace = 0;
+$dtrace = 1 if -f '/usr/include/sys/dtrace.h';
+
+# We need to know the architecture of the Perl binary we'll link with.
+# There's nothing that directly in %Config, as support for 64 bit
+# integers in Perl doesn't necessarily indicate an amd64 build. 
+# So, we figure it out from the symbols defined by the preprocessor.
+#
+my $cpp = $Config{cppsymbols};
+my $arch;
+if ($cpp =~ /__i386/) { # match __i386__ and __i386m for gcc and Sun CC.
+    $arch = 'i386';
 }
-elsif ($platform eq 'solaris') {
-	print STDERR "Building for Solaris\n";
-	symlink 'DTrace_Probe.xs-solaris', 'DTrace_Probe.xs';
-	if (-f '/usr/include/dtrace.h') {
-		print STDERR "DTrace available, building native components\n";
-		$build_native = 1;
-	}
+elsif ($cpp =~ /__x86_64__/) {
+    $arch = 'x86_64';
+}
+else {
+    die "Don't know which ARCH value to use for: $Config{archname}"
+         if $dtrace;
 }
 
-# See lib/ExtUtils/MakeMaker.pm for details of how to influence
-# the contents of the Makefile that is written.
+# Extract the appropriate compiler from Perl - we should use the same
+# compiler as Perl was built with and thus the extension will be built
+# with.
+my $cc = $Config{cc};
+
+# Add a section to the Makefile to build libusdt as a dependency of
+# the Perl extension, if DTrace appears to be available.
+#
+sub MY::postamble {
+    if ($dtrace) {
+        return <<"MAKE_FRAG";
+\$(MYEXTLIB): libusdt/Makefile
+	cd libusdt && CC=$cc ARCH=$arch \$(MAKE) all
+
+MAKE_FRAG
+
+    }
+    else {
+        return <<"MAKE_FRAG";
+\$(MYEXTLIB): libusdt/Makefile
+	\$(NOECHO) \$(NOOP)
+
+MAKE_FRAG
+    }
+}
+
 WriteMakefile(
-    NAME              => 'Devel::DTrace::Provider',
-    VERSION_FROM      => 'lib/Devel/DTrace/Provider.pm', # finds $VERSION
-    PREREQ_PM         => {}, # e.g., Module::Name => 1.1
-    ($] >= 5.005 ?     ## Add these new keywords supported since 5.005
-      (ABSTRACT_FROM  => 'lib/Devel/DTrace/Provider.pm', # retrieve abstract from module
-       AUTHOR         => 'Chris Andrews <chris@nodnol.org>') : ()),
-    LIBS              => [''], # e.g., '-lm'
-    DEFINE            => '-g', # e.g., '-DHAVE_SOMETHING'
-    INC               => '-I.', # e.g., '-I. -I/usr/include/other'
-    ($build_native ? # DTrace available?
-     (OBJECT          => '$(O_FILES)',) : 
-     (NEEDS_LINKING   => 0, SKIP => ['dynamic'])
-    ),
+    NAME          => 'Devel::DTrace::Provider',
+    VERSION_FROM  => 'lib/Devel/DTrace/Provider.pm',
+    ABSTRACT_FROM => 'lib/Devel/DTrace/Provider.pm',
+    AUTHOR        => 'Chris Andrews <chris@nodnol.org>',
+    INC           => '-Ilibusdt',
+    MYEXTLIB      => 'libusdt/libusdt.a',
+    PREREQ_PM     => {
+        'Sub::Exporter' => 0
+    },
+    ($dtrace ? () : (NEEDS_LINKING => 0, SKIP => ['dynamic'])),
 );

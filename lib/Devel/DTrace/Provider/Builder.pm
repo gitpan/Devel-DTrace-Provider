@@ -1,99 +1,114 @@
 package Devel::DTrace::Provider::Builder;
 use strict;
 use warnings;
+use Data::Dumper;
+
+use Sub::Exporter -setup => {
+    exports => [
+        qw/ as /,
+        probe => \&build_probe,
+        provider => \&build_provider,
+        import => \&build_import
+    ],
+    groups  => {
+        default => [ 
+            qw/ as probe provider import /
+        ],
+    },
+    collectors => {
+        INIT => \&capture_caller
+    }
+};
+
 use Devel::DTrace::Provider;
 
-my %providers;
+{
+    my $caller;
+    my $providers;
+    my $coderef;
+    my $provider_name;
 
-sub import {
-	my $caller_package = caller(0);
+    sub capture_caller {
+        my (undef, $args) = @_;
+        $caller = $args->{into};
+    }
 
-	my $coderef;
-	my $provider;
+    sub as (&) {
+        $coderef = shift;
+    }
 
-	my $subs = {};
+    sub build_provider {
+        sub ($$) {
+            $provider_name = shift;
+            my $provider;
+            $provider = Devel::DTrace::Provider->new($provider_name, 'perl')
+                 if Devel::DTrace::Provider::DTRACE_AVAILABLE();
 
-	if (Devel::DTrace::Provider::DTRACE_AVAILABLE()) {
+            $providers->{$caller}->{$provider_name} = {
+                args => {},
+                provider => $provider
+            };
 
-		$subs->{provider} = sub ($$) {
-			my $provider_name = shift;
-			$provider = Devel::DTrace::Provider->new($provider_name, 'perl');
-			$coderef->();
-			$provider->enable;
-			$providers{$caller_package} ||= [];
-			push @{$providers{$caller_package}}, $provider;
-		};
-		
-		$subs->{as} = sub (&) {
-			$coderef = shift;
-		};
-		
-		$subs->{probe} = sub ($;@) {
-			my $probe_name = shift;
-			my @args = @_;
-			$provider->probe($probe_name, @args);
-		};
-		
-		$subs->{import} = sub {
-			my $using_package = shift;
-			my $caller_package = caller(0);
-		
-			my $providers = $providers{$using_package};
-			die "no provider for $using_package" unless defined $providers;
-		
-			for my $provider (@$providers) {
-				for my $probe_name ($provider->probe_names) {
-					no strict 'refs';
-					*{"${caller_package}::${probe_name}"} = $provider->probe_function($probe_name);
-					*{"${caller_package}::${probe_name}_enabled"} = $provider->probe_enabled_function($probe_name);
-				}
-			}
-		};
-	}
-	else {
-		my $provider_name;
+            $coderef->();
 
-		# Just note provider and probe names, don't actually do anything. 
-		$subs->{provider} = sub ($$) {
-			$provider_name = shift;
-			$providers{$caller_package} ||= {};
-			$providers{$caller_package}->{$provider_name} = [];
-			$coderef->();
-		};
-		
-		$subs->{as} = sub (&) {
-			$coderef = shift;
-		};
-		
-		$subs->{probe} = sub ($;@) {
-			my $probe_name = shift;
-			push @{$providers{$caller_package}->{$provider_name}}, $probe_name
-		};
-		
-		# Import routine providing no-op probe subs
-		$subs->{import} = sub {
-			my $using_package = shift;
-			my $caller_package = caller(0);
-		
-			my $providers = $providers{$using_package};
-			die "no provider for $using_package" unless defined $providers;
-		
-			for my $provider (keys %$providers) {
-				for my $probe_name (@{$providers->{$provider}}) {
-					no strict 'refs';
-					*{"${caller_package}::${probe_name}"} = sub (&) { 0 };
-					*{"${caller_package}::${probe_name}_enabled"} = sub () { 0 };
-				}
-			}
-		};
-	}
-	
-	{
-		no strict 'refs';
-		for my $sub (keys %$subs) {
-			*{"${caller_package}::${sub}"} = $subs->{$sub};
-		}
-	}
+            for my $name (keys %{$providers->{$caller}->{$provider_name}->{args}}) {
+                my $args = $providers->{$caller}->{$provider_name}->{args}->{$name};
+                $provider->add_probe($name, 'func', $args)
+                     if Devel::DTrace::Provider::DTRACE_AVAILABLE();
+
+                no strict 'refs';
+                *{"${caller}::${name}"} = probe_function($provider, $name);
+                *{"${caller}::${name}_enabled"} = probe_enabled_function($provider, $name);
+            }
+            $provider->enable
+                 if Devel::DTrace::Provider::DTRACE_AVAILABLE();
+        }
+    }
+
+    sub build_probe {
+        sub ($;@) {
+            my $name = shift;
+            $providers->{$caller}->{$provider_name}->{args}->{$name} = \@_;
+        }
+    }
+
+    sub build_import {
+        sub {
+            my $package = caller(0);
+            for my $provider_name (keys %{$providers->{$caller}}) {
+                my $provider = $providers->{$caller}->{$provider_name}->{provider};
+                for my $name (keys %{$providers->{$caller}->{$provider_name}->{args}}) {
+                    no strict 'refs';
+                    *{"${package}::${name}"} = probe_function($provider, $name);
+                    *{"${package}::${name}_enabled"} = probe_enabled_function($provider, $name);
+                }
+            }
+        }
+    }
+}
+
+sub probe_function { 
+    my ($provider, $probe_name) = @_;
+
+    if (Devel::DTrace::Provider::DTRACE_AVAILABLE()) {
+        my $stub = $provider->probes->{$probe_name};
+        return sub (&) { shift->($stub) if $stub->is_enabled };
+    }
+    else {
+        return sub (&) { 1 };
+    }
+}
+
+sub probe_enabled_function { 
+    my ($provider, $probe_name) = @_;
+
+    if (Devel::DTrace::Provider::DTRACE_AVAILABLE()) {
+        my $stub = $provider->probes->{$probe_name};
+        return sub { $stub->is_enabled };
+    }
+    else {
+        return sub { 0 };
+    }
 }
 
 1;
@@ -109,7 +124,6 @@ Devel::DTrace::Provider::Builder - declaratively create DTrace USDT providers
 =head1 SYNOPSIS
 
   package MyApp::DTraceProviders;
-
   use strict;
   use warnings;
 
@@ -130,6 +144,21 @@ Devel::DTrace::Provider::Builder - declaratively create DTrace USDT providers
   use MyApp::DTraceProviders;
 
   process_start
+
+  # Or use probes immediately in the same package.
+
+  use Devel::DTrace::Provider::Builder;
+  use strict;
+  use warnings;
+
+  BEGIN {
+    provider 'provider1' => as {
+      probe 'probe1', 'string';
+      probe 'probe2', 'string';
+  };
+
+  probe1 { shift->fire('foo') } if probe1_enabled;
+  probe2 { shift->fire('foo') } if probe2_enabled;
 
 =head1 DESCRIPTION
 
@@ -214,7 +243,7 @@ only runs when tracing is active.
 This applies to systems without DTrace: if you form your probe
 tracepoints with a postfix if, like this:
 
-  fooprobe { shift->fire } if fooprobe_enabled();
+  fooprobe { shift->fire } if fooprobe_enabled;
 
 on a system without DTrace, fooprobe_enabled will be a constant sub
 returning 0, and the entire line will be optimised away, which means
@@ -222,11 +251,5 @@ probes embedded in code have zero overhead. This feature is taken from
 Tim Bunce's DashProfiler:
 
 http://search.cpan.org/~timb/DashProfiler-1.13/lib/DashProfiler/Import.pm
-
-=head1 CAVEATS
-
-This code only works on Mac OS X 10.5 "Leopard" and Solaris 10U1 and
-later (including OpenSolaris, SXCE, etc), running on i386 or x86_64
-with a 32 bit perl. SPARC and PowerPC are currently unsupported.
 
 =cut
