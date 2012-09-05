@@ -1,6 +1,6 @@
 --- #YAML:1.0
 name:               Devel-DTrace-Provider
-version:            1.00
+version:            1.01
 abstract:           Create DTrace providers for Perl programs.
 author:
     - Chris Andrews <chris@nodnol.org>
