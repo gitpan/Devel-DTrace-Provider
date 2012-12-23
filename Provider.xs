@@ -3,83 +3,103 @@
 #include "XSUB.h"
 
 #include "ppport.h"
+#include "Av_CharPtrPtr.h"
 
 #include <usdt.h>
 
 typedef enum {
         none = 0,
         integer,
-        string
+        string,
+        json
 } perl_argtype_t;
 
-STATIC MGVTBL probeargs_vtbl = { 0, 0, 0, 0, 0, 0, 0, 0 };
+STATIC MGVTBL probe_vtbl = { 0, 0, 0, 0, 0, 0, 0, 0 };
+STATIC MGVTBL provider_vtbl = { 0, 0, 0, 0, 0, 0, 0, 0 };
 
-struct perl_dtrace_provider {
-        usdt_provider_t *provider;
-        HV *probes;
-};
-
-typedef struct perl_dtrace_provider* Devel__DTrace__Provider;
+typedef usdt_provider_t* Devel__DTrace__Provider;
 typedef usdt_probedef_t* Devel__DTrace__Probe;
 
-/* Used by the INPUT typemap for char**.
- * Will convert a Perl AV* (containing strings) to a C char**.
- */
-char ** XS_unpack_charPtrPtr(SV* rv )
+static MAGIC *
+load_magic(SV *obj, const MGVTBL *vtbl)
 {
-	AV *av;
-	SV **ssv;
-	char **s;
-	int avlen;
-	int x;
+        MAGIC *mg;
 
-	if( SvROK( rv ) && (SvTYPE(SvRV(rv)) == SVt_PVAV) )
-		av = (AV*)SvRV(rv);
-	else {
-		warn("XS_unpack_charPtrPtr: rv was not an AV ref");
-		return( (char**)NULL );
-	}
+        for (mg = SvMAGIC(obj); mg; mg = mg->mg_moremagic)
+                if (mg->mg_type == PERL_MAGIC_ext && mg->mg_virtual == vtbl)
+                        return mg;
 
-	/* is it empty? */
-	avlen = av_len(av);
-	if( avlen < 0 ){
-		warn("XS_unpack_charPtrPtr: array was empty");
-		return( (char**)NULL );
-	}
-
-	/* av_len+2 == number of strings, plus 1 for an end-of-array sentinel.
-	 */
-	s = (char **)safemalloc( sizeof(char*) * (avlen + 2) );
-	if( s == NULL ){
-		warn("XS_unpack_charPtrPtr: unable to malloc char**");
-		return( (char**)NULL );
-	}
-	for( x = 0; x <= avlen; ++x ){
-		ssv = av_fetch( av, x, 0 );
-		if( ssv != NULL ){
-			if( SvPOK( *ssv ) ){
-				s[x] = (char *)safemalloc( SvCUR(*ssv) + 1 );
-				if( s[x] == NULL )
-					warn("XS_unpack_charPtrPtr: unable to malloc char*");
-				else
-					strcpy( s[x], SvPV( *ssv, PL_na ) );
-			}
-			else
-				warn("XS_unpack_charPtrPtr: array elem %d was not a string.", x );
-		}
-		else
-			s[x] = (char*)NULL;
-	}
-	s[x] = (char*)NULL; /* sentinel */
-	return( s );
+        Perl_croak(aTHX_ "Missing magic?");
+        return NULL;
 }
 
-void XS_release_charPtrPtr(char **s)
+static void *
+integer_argument(SV *obj)
 {
-	char **c;
-	for( c = s; *c != NULL; ++c )
-		safefree( *c );
-	safefree( s );
+        long ret;
+
+        if (SvIOK(obj))
+                ret = SvIV(obj);
+        else
+                Perl_croak(aTHX_ "Argument type mismatch: should be integer");
+
+        return (void *) ret;
+}
+
+static void *
+string_argument(SV *obj)
+{
+        char *ret;
+
+        if (SvPOK(obj))
+                ret = SvPV_nolen(obj);
+        else
+                Perl_croak(aTHX_ "Argument type mismatch: should be string");
+
+        return (void *) ret;
+}
+
+static void *
+json_argument(SV *obj)
+{
+        int count;
+        SV *json;
+        char *ret = NULL;
+
+        dSP;
+
+	ENTER;
+        SAVETMPS;
+
+        PUSHMARK(SP);
+        XPUSHs(obj);
+        PUTBACK;
+
+        count = call_pv("JSON::to_json", G_EVAL | G_SCALAR);
+
+        SPAGAIN;
+
+        if (SvTRUE(ERRSV)) {
+                (void )POPs;
+                Perl_croak(aTHX_ "Error JSON serializing: %s\n", SvPV_nolen(ERRSV));
+        }
+        else {
+                json = POPs;
+                if (SvPOK(json)) {
+                        ret = (char *)safemalloc( SvCUR(json) + 1 );
+
+                        if (ret == NULL)
+                                Perl_croak(aTHX_ "json_object: unable to malloc char*");
+                        else
+                                strcpy(ret, SvPV_nolen(json));
+                }
+        }
+
+        PUTBACK;
+        FREETMPS;
+        LEAVE;
+
+        return (void *)ret;
 }
 
 MODULE = Devel::DTrace::Provider               PACKAGE = Devel::DTrace::Provider
@@ -92,19 +112,28 @@ new(package, name, module)
         char *name
         char *module;
 
+        INIT:
+        SV *probes;
+
         CODE:
-        RETVAL = malloc(sizeof(struct perl_dtrace_provider *));
+        RETVAL = usdt_create_provider(name, module);
         if (RETVAL == NULL)
-                Perl_croak(aTHX_ "Failed to allocate memory for provider: %s", strerror(errno));
+                Perl_croak(aTHX_ "Failed to allocate memory for provider: %s",
+                           strerror(errno));
 
-        RETVAL->provider = usdt_create_provider(name, module);
-        if (RETVAL->provider == NULL)
-                Perl_croak(aTHX_ "Failed to allocate memory for provider: %s", strerror(errno));
+        ST(0) = sv_newmortal();
+        sv_setref_pv(ST(0), "Devel::DTrace::Provider", (void*)RETVAL);
 
-        RETVAL->probes = newHV();
+        probes = (SV *)newHV();
+        sv_magicext(SvRV(ST(0)), probes, PERL_MAGIC_ext,&provider_vtbl,
+                    NULL, 0);
 
-        OUTPUT:
-        RETVAL
+void
+DESTROY (self)
+        Devel::DTrace::Provider self;
+CODE:
+        usdt_provider_disable(self);
+        usdt_provider_free(self);
 
 Devel::DTrace::Probe
 add_probe(self, name, function, perl_types)
@@ -119,8 +148,12 @@ add_probe(self, name, function, perl_types)
         const char *dtrace_types[USDT_ARG_MAX];
         perl_argtype_t *types;
         MAGIC *mg;
+        HV *probes;
 
         CODE:
+        mg = load_magic(SvRV(ST(0)), &provider_vtbl);
+        probes = (HV *)mg->mg_obj;
+
         types = malloc(USDT_ARG_MAX * sizeof(perl_argtype_t));
 
         for (i = 0; i < USDT_ARG_MAX; i++) {
@@ -137,48 +170,67 @@ add_probe(self, name, function, perl_types)
                         types[i] = string;
                         argc++;
                 }
+                else if (strncmp("json", perl_types[i], 4) == 0) {
+                        dtrace_types[i] = "char *";
+                        types[i] = json;
+                        argc++;
+                }
                 else {
                         dtrace_types[i] = NULL;
                         types[i] = none;
                 }
         }
-        free(perl_types);
+        XS_release_charPtrPtr(perl_types);
 
         RETVAL = usdt_create_probe(function, name, argc, dtrace_types);
         if (RETVAL == NULL)
                 Perl_croak(aTHX_ "create probe failed");
 
-        if ((usdt_provider_add_probe(self->provider, RETVAL) < 0))
-                Perl_croak(aTHX_ "add probe: %s", usdt_errstr(self->provider));
+        if ((usdt_provider_add_probe(self, RETVAL) < 0))
+                Perl_croak(aTHX_ "add probe: %s", usdt_errstr(self));
 
         ST(0) = sv_newmortal();
         sv_setref_pv(ST(0), "Devel::DTrace::Probe", (void*)RETVAL);
-        sv_magicext(SvRV(ST(0)), Nullsv, PERL_MAGIC_ext, &probeargs_vtbl,
+        sv_magicext(SvRV(ST(0)), Nullsv, PERL_MAGIC_ext, &probe_vtbl,
                     (const char *) types, 0);
 
-        (void) hv_store(self->probes, name, strlen(name), SvREFCNT_inc((SV *)ST(0)), 0);
+        (void) hv_store(probes, name, strlen(name), SvREFCNT_inc((SV *)ST(0)), 0);
 
 void
 remove_probe(self, probe)
         Devel::DTrace::Provider self
         Devel::DTrace::Probe probe;
 
-        CODE:
-        (void) hv_delete(self->probes, probe->name, strlen(probe->name), G_DISCARD);
+        INIT:
+        MAGIC *mg;
+        HV *probes;
 
-        if (usdt_provider_remove_probe(self->provider, probe) < 0)
-                Perl_croak(aTHX_ "%s", usdt_errstr(self->provider));
+        CODE:
+        mg = load_magic(SvRV(ST(0)), &provider_vtbl);
+        probes = (HV *)mg->mg_obj;
+
+        (void) hv_delete(probes, probe->name, strlen(probe->name), G_DISCARD);
+
+        if (usdt_provider_remove_probe(self, probe) < 0)
+                Perl_croak(aTHX_ "%s", usdt_errstr(self));
 
 
 SV *
 enable(self)
         Devel::DTrace::Provider self
 
-        CODE:
-        if (usdt_provider_enable(self->provider) < 0)
-                Perl_croak(aTHX_ "%s", usdt_errstr(self->provider));
+        INIT:
+        MAGIC *mg;
+        HV *probes;
 
-        RETVAL = newRV_inc((SV *)self->probes);
+        CODE:
+        mg = load_magic(SvRV(ST(0)), &provider_vtbl);
+        probes = (HV *)mg->mg_obj;
+
+        if (usdt_provider_enable(self) < 0)
+                Perl_croak(aTHX_ "%s", usdt_errstr(self));
+
+        RETVAL = newRV_inc((SV *)probes);
 
         OUTPUT:
         RETVAL
@@ -188,16 +240,22 @@ disable(self)
         Devel::DTrace::Provider self
 
         CODE:
-        if (usdt_provider_disable(self->provider) < 0)
-                Perl_croak(aTHX_ "%s", usdt_errstr(self->provider));
-
+        if (usdt_provider_disable(self) < 0)
+                Perl_croak(aTHX_ "%s", usdt_errstr(self));
 
 SV *
 probes(self)
         Devel::DTrace::Provider self
 
+        INIT:
+        MAGIC *mg;
+        HV *probes;
+
         CODE:
-        RETVAL = newRV_inc((SV *)self->probes);
+        mg = load_magic(SvRV(ST(0)), &provider_vtbl);
+        probes = (HV *)mg->mg_obj;
+
+        RETVAL = newRV_inc((SV *)probes);
 
         OUTPUT:
         RETVAL
@@ -205,6 +263,12 @@ probes(self)
 MODULE = Devel::DTrace::Provider               PACKAGE = Devel::DTrace::Probe
 
 PROTOTYPES: DISABLE
+
+void
+DESTROY (self)
+        Devel::DTrace::Probe self;
+CODE:
+        usdt_probe_release(self);
 
 int
 fire(self, ...)
@@ -222,11 +286,8 @@ Devel::DTrace::Probe self
                 Perl_croak(aTHX_ "Probe takes %ld arguments, %ld provided",
                            self->argc, argc);
 
-        for (mg = SvMAGIC(SvRV(ST(0))); mg; mg = mg->mg_moremagic)
-                if (mg->mg_type == PERL_MAGIC_ext && mg->mg_virtual == &probeargs_vtbl)
-                        types = (perl_argtype_t *)mg->mg_ptr;
-        if (types == NULL)
-                Perl_croak(aTHX_ "Missing probe magic?");
+        mg = load_magic(SvRV(ST(0)), &probe_vtbl);
+        types = (perl_argtype_t *)mg->mg_ptr;
 
   	for (i = 0; i < self->argc; i++) {
                 switch (types[i]) {
@@ -234,21 +295,30 @@ Devel::DTrace::Probe self
                         argv[i] = NULL;
                         break;
                 case integer:
-                        if (SvIOK(ST(i + 1)))
-                                argv[i] = (void *)(SvIV(ST(i + 1)));
-                        else
-                                Perl_croak(aTHX_ "Argument type mismatch: %ld should be integer", i);
+                        argv[i] = integer_argument(ST(i + 1));
                         break;
                 case string:
-                        if (SvPOK(ST(i + 1)))
-                                argv[i] = (void *)(SvPV_nolen(ST(i + 1)));
-                        else
-                                Perl_croak(aTHX_ "Argument type mismatch: %ld should be string", i);
+                        argv[i] = string_argument(ST(i + 1));
+                        break;
+                case json:
+                        argv[i] = json_argument(ST(i + 1));
                         break;
                 }
-	};
+	}
 
         usdt_fire_probe(self->probe, argc, argv);
+
+        for (i = 0; i < self->argc; i++) {
+                switch (types[i]) {
+                case none:
+                case integer:
+                case string:
+                        break;
+                case json:
+                        free(argv[i]);
+                        break;
+                }
+        }
 
         RETVAL = 1; /* XXX */
 

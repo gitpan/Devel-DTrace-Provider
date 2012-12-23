@@ -18,5 +18,7 @@ no_index:
     - t
     - inc
 requires:
+  JSON: 0
   Sub::Exporter: 0
-version: 1.03
+  Sub::Install: 0
+version: 1.10
