@@ -21,4 +21,4 @@ requires:
   JSON: 0
   Sub::Exporter: 0
   Sub::Install: 0
-version: 1.10
+version: 1.11
